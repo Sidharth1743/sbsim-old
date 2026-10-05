@@ -15,6 +15,7 @@ import gin
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from tensorflow.python.eager import context as tf_context  # pylint: disable=g-direct-tensorflow-import
 
 from smart_control.simulator import building as building_py
 from smart_control.simulator import hvac_floorplan_based as hvac_py
@@ -502,6 +503,7 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
       start_timestamp: pd.Timestamp,
       relative_convergence_threshold: float | None = 1e-6,
       relative_convergence_streak: int = 20,
+      use_graph_fd_loop: bool = True,
   ):
 
     super().__init__(
@@ -559,6 +561,255 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
     self.include_interior_mass = building.include_interior_mass
     if self.include_interior_mass:
       self._initialize_interior_mass_tensors(building)
+
+    # The graph loop covers the configuration without interior mass or
+    # radiative exchange. Other configurations keep the eager per-iteration
+    # path in Simulator.finite_differences_timestep.
+    self._use_graph_fd_loop = (
+        use_graph_fd_loop
+        and not self.include_interior_mass
+        and not self.include_radiative_heat_transfer
+    )
+    if self._use_graph_fd_loop:
+      self._initialize_graph_fd_loop()
+
+  def _initialize_graph_fd_loop(self) -> None:
+    """Builds the constants and compiled loop for the graph FD timestep."""
+    # Convection masks, so the per-step coefficient tensors equal those from
+    # get_oriented_convection_coefficient_tensors without the Python loop.
+    (
+        t_h_left,
+        t_h_right,
+        t_h_top,
+        t_h_bottom,
+    ) = get_oriented_convection_coefficient_tensors(
+        1.0, self.building.temp.shape, self._boundary_cv_mapping
+    )
+    self._t_convection_masks = tuple(
+        tf.math.not_equal(t, 0.0)
+        for t in (t_h_left, t_h_right, t_h_top, t_h_bottom)
+    )
+    shape = self.building.temp.shape
+    grid = tf.TensorSpec(shape=shape, dtype=tf.float32)
+    scalar = tf.TensorSpec(shape=(), dtype=tf.float32)
+    self._graph_fd_loop = tf.function(
+        self._graph_fd_loop_impl,
+        input_signature=[grid, grid, grid, grid, grid, scalar, scalar],
+        jit_compile=False,
+    )
+    # Grappler rewrites change float32 rounding in some CVs, so this function
+    # runs with the meta optimizer disabled. The options are thread-local and
+    # set only around the call, leaving other tf.functions (the agent) as is.
+    ctx = tf_context.context()
+    config = ctx.config
+    config.allow_soft_placement = True
+    config.graph_options.rewrite_options.disable_meta_optimizer = True
+    self._graph_fd_call_options = tf_context.FunctionCallOptions(
+        config_proto=config
+    )
+
+  def _call_graph_fd_loop(self, *args) -> tuple[tf.Tensor, ...]:
+    """Calls the graph FD loop with grappler disabled for this call only."""
+    thread_local = tf_context.context()._thread_local_data  # pylint: disable=protected-access
+    previous = thread_local.function_call_options
+    thread_local.function_call_options = self._graph_fd_call_options
+    try:
+      return self._graph_fd_loop(*args)
+    finally:
+      thread_local.function_call_options = previous
+
+  def _graph_fd_loop_impl(
+      self,
+      t_temp_initial: tf.Tensor,
+      t_temp_minus: tf.Tensor,
+      t_input_q: tf.Tensor,
+      t_density: tf.Tensor,
+      t_heat_capacity: tf.Tensor,
+      t_temp_inf: tf.Tensor,
+      t_convection_coefficient: tf.Tensor,
+  ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Runs the FD iterations of update_temperature_estimates in one graph.
+
+    Each iteration performs the float32 operations of
+    update_temperature_estimates in the same order. Terms that do not depend
+    on the current estimate are computed once per timestep instead of once per
+    iteration, which yields the same values.
+
+    Args:
+      t_temp_initial: First temperature estimate, float32.
+      t_temp_minus: Building temperature at the previous timestep, float32.
+      t_input_q: External heat source per CV, float32.
+      t_density: Density per CV, float32.
+      t_heat_capacity: Heat capacity per CV, float32.
+      t_temp_inf: Ambient temperature, float32.
+      t_convection_coefficient: Air convection coefficient, float32.
+
+    Returns:
+      The final estimate, the number of iterations run, and the max_delta of
+      every iteration run (unused entries are zero).
+    """
+    zero = tf.zeros_like(t_temp_initial)
+    t_h_left, t_h_right, t_h_top, t_h_bottom = (
+        tf.where(mask, t_convection_coefficient, zero)
+        for mask in self._t_convection_masks
+    )
+    t_z = tf.constant(self.building.floor_height_cm / 100.0, dtype=tf.float32)
+    t_delta_t = tf.constant(self._time_step_sec, dtype=tf.float32)
+    t_u = self._t_u
+    t_v = self._t_v
+
+    t_uz = tf.scalar_mul(t_z, t_u)
+    t_vz = tf.scalar_mul(t_z, t_v)
+    t_k1_div_u = tf.math.divide(self._t_conductivity_left_edge, t_u)
+    t_k3_div_u = tf.math.divide(self._t_conductivity_right_edge, t_u)
+    t_k2_div_v = tf.math.divide(self._t_conductivity_bottom_edge, t_v)
+    t_k4_div_v = tf.math.divide(self._t_conductivity_top_edge, t_v)
+
+    # Denominator, as in _get_denominator (dt4 is zero without interior mass).
+    dt1 = tf.math.add(t_k1_div_u, t_k3_div_u)
+    dt1 = tf.math.add(dt1, t_h_left)
+    dt1 = tf.math.add(dt1, t_h_right)
+    dt1 = tf.math.multiply(t_vz, dt1)
+    dt2 = tf.math.add(t_k2_div_v, t_k4_div_v)
+    dt2 = tf.math.add(dt2, t_h_bottom)
+    dt2 = tf.math.add(dt2, t_h_top)
+    dt2 = tf.math.multiply(t_uz, dt2)
+    storage = tf.math.multiply(t_density, t_u)
+    storage = tf.math.multiply(storage, t_v)
+    storage = tf.math.multiply(storage, t_heat_capacity)
+    storage = tf.scalar_mul(t_z, storage)
+    dt3 = tf.math.divide(storage, t_delta_t)
+    t_denom = tf.math.add(dt1, dt2)
+    t_denom = tf.math.add(t_denom, dt3)
+    t_denom = tf.math.add(t_denom, tf.zeros_like(dt3))
+
+    # Estimate-independent numerator terms, as in _get_numerator.
+    t_h_left_tinf = tf.math.scalar_mul(t_temp_inf, t_h_left)
+    t_h_right_tinf = tf.math.scalar_mul(t_temp_inf, t_h_right)
+    t_h_above_tinf = tf.math.scalar_mul(t_temp_inf, t_h_top)
+    t_h_below_tinf = tf.math.scalar_mul(t_temp_inf, t_h_bottom)
+    nt3 = tf.math.multiply(storage, t_temp_minus)
+    nt3 = tf.math.divide(nt3, t_delta_t)
+
+    t_exterior_temp = tf.fill(tf.shape(t_temp_initial), t_temp_inf)
+    threshold = tf.constant(self._convergence_threshold, dtype=tf.float64)
+    limit = self._iteration_limit
+
+    def body(i, t_temp, _, deltas):
+      # Same values as shift_tensor_{left,right,down,up}, without the masks.
+      t_temp_left = tf.concat(
+          [t_temp[:, 1:], tf.fill([t_temp.shape[0], 1], t_temp_inf)], axis=1
+      )
+      t_temp_right = tf.concat(
+          [tf.fill([t_temp.shape[0], 1], t_temp_inf), t_temp[:, :-1]], axis=1
+      )
+      t_temp_above = tf.concat(
+          [tf.fill([1, t_temp.shape[1]], t_temp_inf), t_temp[:-1, :]], axis=0
+      )
+      t_temp_below = tf.concat(
+          [t_temp[1:, :], tf.fill([1, t_temp.shape[1]], t_temp_inf)], axis=0
+      )
+
+      nt1 = tf.math.add(
+          tf.math.multiply(t_k1_div_u, t_temp_left),
+          tf.math.multiply(t_k3_div_u, t_temp_right),
+      )
+      nt1 = tf.math.add(nt1, t_h_left_tinf)
+      nt1 = tf.math.add(nt1, t_h_right_tinf)
+      nt1 = tf.math.multiply(t_vz, nt1)
+      nt2 = tf.math.add(
+          tf.math.multiply(t_k2_div_v, t_temp_below),
+          tf.math.multiply(t_k4_div_v, t_temp_above),
+      )
+      nt2 = tf.math.add(nt2, t_h_below_tinf)
+      nt2 = tf.math.add(nt2, t_h_above_tinf)
+      nt2 = tf.math.multiply(t_uz, nt2)
+      t_numer = tf.math.add(nt1, nt2)
+      t_numer = tf.math.add(t_numer, nt3)
+      t_numer = tf.math.add(t_numer, t_input_q)
+      t_numer = tf.math.add(t_numer, zero)
+      t_numer = tf.math.add(t_numer, zero)
+
+      t_estimate = tf.math.divide(t_numer, t_denom)
+      t_estimate = tf.where(
+          self._t_exerior_temps_mask, t_exterior_temp, t_estimate
+      )
+      max_delta = tf.math.reduce_max(
+          tf.math.abs(tf.math.subtract(t_estimate, t_temp))
+      )
+      deltas = tf.tensor_scatter_nd_update(deltas, [[i]], [max_delta])
+      # numpy compares the float32 max_delta with the Python float threshold
+      # in float64.
+      converged = tf.cast(max_delta, tf.float64) <= threshold
+      return i + 1, t_estimate, converged, deltas
+
+    def cond(i, unused_t_temp, converged, unused_deltas):
+      return tf.logical_and(i < limit, tf.logical_not(converged))
+
+    n_iter, t_temp, _, deltas = tf.while_loop(
+        cond,
+        body,
+        (
+            tf.constant(0),
+            t_temp_initial,
+            tf.constant(False),
+            tf.zeros([max(limit, 1)], dtype=tf.float32),
+        ),
+    )
+    return t_temp, n_iter, deltas
+
+  def finite_differences_timestep(
+      self, *, ambient_temperature: float, convection_coefficient: float
+  ) -> bool:
+    """Runs Simulator.finite_differences_timestep as one compiled TF graph.
+
+    Results, warnings, and the return value match the parent method. Falls back
+    to the parent when interior mass or radiative exchange is enabled, or when
+    use_graph_fd_loop is False.
+
+    Args:
+      ambient_temperature: Current temperature in K of external air.
+      convection_coefficient: Current wind convection coefficient (W/m2/K).
+
+    Returns:
+      Whether or not there was convergence before iteration_limit was reached.
+    """
+    if not self._use_graph_fd_loop:
+      return super().finite_differences_timestep(
+          ambient_temperature=ambient_temperature,
+          convection_coefficient=convection_coefficient,
+      )
+
+    building = self.building
+    t_temp, n_iter, deltas = self._call_graph_fd_loop(  # pylint: disable=unpacking-non-sequence
+        tf.convert_to_tensor(building.temp.copy(), dtype=tf.float32),
+        tf.convert_to_tensor(building.temp, dtype=tf.float32),
+        tf.convert_to_tensor(building.input_q, dtype=tf.float32),
+        tf.convert_to_tensor(building.density, dtype=tf.float32),
+        tf.convert_to_tensor(building.heat_capacity, dtype=tf.float32),
+        tf.constant(ambient_temperature, dtype=tf.float32),
+        tf.constant(convection_coefficient, dtype=tf.float32),
+    )
+    n_iter = int(n_iter)
+    deltas = deltas.numpy()
+    if n_iter >= self._iteration_warning:
+      logging.warning(
+          'Step %d, not converged in %d steps, max_delta = %3.3f',
+          self._iteration_warning - 1,
+          self._iteration_warning,
+          deltas[self._iteration_warning - 1],
+      )
+    converged_successfully = n_iter > 0 and (
+        deltas[n_iter - 1] <= self._convergence_threshold
+    )
+    if not converged_successfully:
+      logging.warning(
+          'Max iteration count reached, max_delta = %3.3f',
+          deltas[n_iter - 1] if n_iter > 0 else float('nan'),
+      )
+
+    building.temp = t_temp.numpy()
+    return converged_successfully
 
   def _get_tensor_exterior_mask(
       self, building: building_py.Building

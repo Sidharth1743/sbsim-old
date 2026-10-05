@@ -759,6 +759,44 @@ class TFSimulatorTest(absltest.TestCase):
     )
     self.assertTrue(result)
 
+  def test_graph_fd_loop_matches_eager_loop_exactly(self):
+    """The graph FD loop must reproduce the eager loop bit for bit."""
+    weather_controller = mock.create_autospec(
+        weather_controller_py.WeatherController
+    )
+    start_timestamp = pd.Timestamp("2012-12-21")
+    for iteration_limit, convergence_threshold in [(4, 0.1), (50, 1e-3)]:
+      results = []
+      for use_graph_fd_loop in (False, True):
+        building = self._create_test_building()
+        building.input_q[2, 3] = 1500.0
+        building.input_q[4, 5] = -800.0
+        tf_simulator = tf_simulator_py.TFSimulator(
+            building,
+            self._create_small_hvac(),
+            weather_controller,
+            300.0,
+            convergence_threshold,
+            iteration_limit,
+            2,
+            start_timestamp,
+            use_graph_fd_loop=use_graph_fd_loop,
+        )
+        converged = []
+        for ambient_temperature in (285.0, 301.3):
+          converged.append(
+              tf_simulator.finite_differences_timestep(
+                  ambient_temperature=ambient_temperature,
+                  convection_coefficient=12.0,
+              )
+          )
+        results.append((building.temp.copy(), converged))
+
+      (eager_temp, eager_converged), (graph_temp, graph_converged) = results  # pylint: disable=unbalanced-tuple-unpacking
+      self.assertEqual(eager_temp.dtype, graph_temp.dtype)
+      np.testing.assert_array_equal(eager_temp, graph_temp)
+      self.assertEqual(eager_converged, graph_converged)
+
   def test_finite_difference_convergence_with_radiative_heat_transfer(self):
     """Tests that the FD problem with radiative heat transfer converges within
     a fixed number of steps."""

@@ -1292,7 +1292,19 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
       raise ValueError("Zone name is not present in room_dict.")
 
     zone_coordinates = self._room_dict[zone_name]
-    temps = [self.temp[coord] for coord in zone_coordinates]
+    # Fancy indexing yields the same array, in the same order and dtype, as
+    # [self.temp[coord] for coord in zone_coordinates], so the stats match.
+    cache = self.__dict__.setdefault("_zone_index_cache", {})
+    cached = cache.get(zone_name)
+    if (
+        cached is None
+        or cached[0] is not zone_coordinates
+        or len(cached[1]) != len(zone_coordinates)
+    ):
+      coords = np.asarray(zone_coordinates, dtype=np.int64).reshape(-1, 2)
+      cached = (zone_coordinates, coords[:, 0], coords[:, 1])
+      cache[zone_name] = cached
+    temps = self.temp[cached[1], cached[2]]
     return np.min(temps), np.max(temps), np.mean(temps)
 
   def get_zone_average_temps(self) -> Dict[str, Any]:
