@@ -1234,6 +1234,37 @@ class FlexibleFloorplanSimulatorTest(parameterized.TestCase):
     for temperature in avg_temperatures.values():
       self.assertGreater(temperature, initial_temperature)
 
+  def test_record_video_false_keeps_no_frames_and_same_temps(self):
+    """record_video only controls frame logging, not the simulation."""
+    results = {}
+    for record_video in (True, False):
+      weather_controller = weather_controller_py.WeatherController(300.0, 300.0)
+      building = self._create_scenario_building(initial_temp=292.0)
+      hvac = self._create_scenario_hvac(
+          zone_identifier=building._room_dict.keys()
+      )
+      sim = simulator_py.SimulatorFlexibleGeometries(
+          building,
+          hvac,
+          weather_controller,
+          300.0,
+          0.1,
+          100,
+          10,
+          pd.Timestamp("12-21-2012"),
+          record_video=record_video,
+      )
+      for _ in range(3):
+        sim.step_sim()
+      results[record_video] = (
+          building.temp.copy(),
+          len(sim._log_and_plotter._temperature_arrays),
+      )
+
+    self.assertEqual(results[True][1], 3)
+    self.assertEqual(results[False][1], 0)
+    np.testing.assert_array_equal(results[True][0], results[False][0])
+
   def test_step_sim_heating_scenario_zone_temperature_speeds(self):
     """Tests that certain zones heat faster than others.
 

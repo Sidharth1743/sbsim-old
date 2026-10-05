@@ -106,3 +106,99 @@ void shuffle_rooms(uint32_t *mt, int64_t *index, double p, int64_t n_rooms,
   for (int i = 0; i < MT_N; i++) mt[i] = s.mt[i];
   *index = s.index;
 }
+
+// Same random draws and order as shuffle_rooms, but writes the shuffled swap
+// list instead of applying it. Swaps of room r are swap_a/swap_b[
+// swap_offsets[r] .. swap_offsets[r + 1]); swap_a and swap_b hold at least
+// room_offsets[n_rooms] entries. Swaps depend only on the random stream and
+// the plan, so applying them in order to any grid gives shuffle_rooms' result.
+void generate_swaps(uint32_t *mt, int64_t *index, double p, int64_t n_rooms,
+                    const int64_t *room_offsets, const int64_t *cvs,
+                    const int64_t *cand_offsets, const int64_t *cands,
+                    int32_t *swap_a, int32_t *swap_b, int64_t *swap_offsets) {
+  mt_state s;
+  for (int i = 0; i < MT_N; i++) s.mt[i] = mt[i];
+  s.index = *index;
+
+  int64_t out = 0;
+  swap_offsets[0] = 0;
+  for (int64_t r = 0; r < n_rooms; r++) {
+    int64_t first = out;
+    for (int64_t c = room_offsets[r]; c < room_offsets[r + 1]; c++) {
+      if (0.0 + (1.0 - 0.0) * mt_random(&s) > p) continue;
+      int64_t n_cands = cand_offsets[c + 1] - cand_offsets[c];
+      uint64_t j = mt_randbelow(&s, (uint64_t)n_cands);
+      swap_a[out] = (int32_t)cvs[c];
+      swap_b[out] = (int32_t)cands[cand_offsets[c] + j];
+      out++;
+    }
+    int64_t n_swaps = out - first;
+    for (int64_t i = n_swaps - 1; i >= 1; i--) {
+      int64_t j = (int64_t)mt_randbelow(&s, (uint64_t)(i + 1));
+      int32_t ta = swap_a[first + i], tb = swap_b[first + i];
+      swap_a[first + i] = swap_a[first + j];
+      swap_b[first + i] = swap_b[first + j];
+      swap_a[first + j] = ta;
+      swap_b[first + j] = tb;
+    }
+    swap_offsets[r + 1] = out;
+  }
+
+  for (int i = 0; i < MT_N; i++) mt[i] = s.mt[i];
+  *index = s.index;
+}
+
+// Records the tempered 32-bit words generate_swaps consumes, per room, in
+// consumption order: words of room r are words[word_offsets[r] ..
+// word_offsets[r + 1]). Advances the state like generate_swaps. Returns the
+// number of words, or -1 if more than max_words would be needed (the state is
+// then left unspecified). Used to prove that a generator consuming these words
+// reproduces generate_swaps.
+static int64_t rec_n, rec_max;
+static uint32_t *rec_buf;
+
+static uint32_t rec_next(mt_state *s) {
+  uint32_t w = mt_next(s);
+  if (rec_n < rec_max) rec_buf[rec_n] = w;
+  rec_n++;
+  return w;
+}
+
+static double rec_random(mt_state *s) {
+  uint32_t a = rec_next(s) >> 5;
+  uint32_t b = rec_next(s) >> 6;
+  return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0);
+}
+
+static uint64_t rec_randbelow(mt_state *s, uint64_t n) {
+  int k = bit_length(n);
+  uint64_t r = rec_next(s) >> (32 - k);
+  while (r >= n) r = rec_next(s) >> (32 - k);
+  return r;
+}
+
+int64_t record_swap_words(uint32_t *mt, int64_t *index, double p,
+                          int64_t n_rooms, const int64_t *room_offsets,
+                          const int64_t *cand_offsets, uint32_t *words,
+                          int64_t max_words, int64_t *word_offsets) {
+  mt_state s;
+  for (int i = 0; i < MT_N; i++) s.mt[i] = mt[i];
+  s.index = *index;
+  rec_n = 0;
+  rec_max = max_words;
+  rec_buf = words;
+  word_offsets[0] = 0;
+  for (int64_t r = 0; r < n_rooms; r++) {
+    int64_t n_swaps = 0;
+    for (int64_t c = room_offsets[r]; c < room_offsets[r + 1]; c++) {
+      if (0.0 + (1.0 - 0.0) * rec_random(&s) > p) continue;
+      rec_randbelow(&s, (uint64_t)(cand_offsets[c + 1] - cand_offsets[c]));
+      n_swaps++;
+    }
+    for (int64_t i = n_swaps - 1; i >= 1; i--) rec_randbelow(&s, (uint64_t)(i + 1));
+    word_offsets[r + 1] = rec_n;
+  }
+  for (int i = 0; i < MT_N; i++) mt[i] = s.mt[i];
+  *index = s.index;
+  return rec_n > max_words ? -1 : rec_n;
+}

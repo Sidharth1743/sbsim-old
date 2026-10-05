@@ -78,6 +78,34 @@ def _load_kernel() -> Optional[ctypes.CDLL]:
         i64p,
         i64p,
     ]
+    i32p = np.ctypeslib.ndpointer(np.int32, flags="C_CONTIGUOUS")
+    lib.generate_swaps.restype = None
+    lib.generate_swaps.argtypes = [
+        np.ctypeslib.ndpointer(np.uint32, flags="C_CONTIGUOUS"),
+        i64p,
+        ctypes.c_double,
+        ctypes.c_int64,
+        i64p,
+        i64p,
+        i64p,
+        i64p,
+        i32p,
+        i32p,
+        i64p,
+    ]
+    u32p = np.ctypeslib.ndpointer(np.uint32, flags="C_CONTIGUOUS")
+    lib.record_swap_words.restype = ctypes.c_int64
+    lib.record_swap_words.argtypes = [
+        u32p,
+        i64p,
+        ctypes.c_double,
+        ctypes.c_int64,
+        i64p,
+        i64p,
+        u32p,
+        ctypes.c_int64,
+        i64p,
+    ]
     _kernel = lib
   except (OSError, subprocess.CalledProcessError) as e:
     logging.warning(

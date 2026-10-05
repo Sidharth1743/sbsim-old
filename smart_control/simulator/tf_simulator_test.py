@@ -11,6 +11,7 @@ import tensorflow as tf
 from smart_control.simulator import air_handler as air_handler_py
 from smart_control.simulator import boiler as boiler_py
 from smart_control.simulator import building as building_py
+from smart_control.simulator import cuda_fd
 from smart_control.simulator import hvac_floorplan_based as floorplan_hvac_py
 from smart_control.simulator import setpoint_schedule
 from smart_control.simulator import simulator_flexible_floor_plan as simulator_py
@@ -759,43 +760,79 @@ class TFSimulatorTest(absltest.TestCase):
     )
     self.assertTrue(result)
 
-  def test_graph_fd_loop_matches_eager_loop_exactly(self):
-    """The graph FD loop must reproduce the eager loop bit for bit."""
+  def _run_fd_backend(
+      self,
+      iteration_limit,
+      convergence_threshold,
+      use_graph_fd_loop,
+      use_cuda_fd_kernel,
+      cuda_fd_fuse_k=8,
+  ):
+    """Runs two FD timesteps and returns (temps, converged, used_cuda)."""
     weather_controller = mock.create_autospec(
         weather_controller_py.WeatherController
     )
-    start_timestamp = pd.Timestamp("2012-12-21")
-    for iteration_limit, convergence_threshold in [(4, 0.1), (50, 1e-3)]:
-      results = []
-      for use_graph_fd_loop in (False, True):
-        building = self._create_test_building()
-        building.input_q[2, 3] = 1500.0
-        building.input_q[4, 5] = -800.0
-        tf_simulator = tf_simulator_py.TFSimulator(
-            building,
-            self._create_small_hvac(),
-            weather_controller,
-            300.0,
-            convergence_threshold,
-            iteration_limit,
-            2,
-            start_timestamp,
-            use_graph_fd_loop=use_graph_fd_loop,
-        )
-        converged = []
-        for ambient_temperature in (285.0, 301.3):
-          converged.append(
-              tf_simulator.finite_differences_timestep(
-                  ambient_temperature=ambient_temperature,
-                  convection_coefficient=12.0,
-              )
+    building = self._create_test_building()
+    building.input_q[2, 3] = 1500.0
+    building.input_q[4, 5] = -800.0
+    tf_simulator = tf_simulator_py.TFSimulator(
+        building,
+        self._create_small_hvac(),
+        weather_controller,
+        300.0,
+        convergence_threshold,
+        iteration_limit,
+        2,
+        pd.Timestamp("2012-12-21"),
+        use_graph_fd_loop=use_graph_fd_loop,
+        use_cuda_fd_kernel=use_cuda_fd_kernel,
+        cuda_fd_fuse_k=cuda_fd_fuse_k,
+    )
+    converged = []
+    for ambient_temperature in (285.0, 301.3):
+      converged.append(
+          tf_simulator.finite_differences_timestep(
+              ambient_temperature=ambient_temperature,
+              convection_coefficient=12.0,
           )
-        results.append((building.temp.copy(), converged))
+      )
+    used_cuda = tf_simulator._cuda_fd is not None
+    return building.temp.copy(), converged, used_cuda
 
-      (eager_temp, eager_converged), (graph_temp, graph_converged) = results  # pylint: disable=unbalanced-tuple-unpacking
+  def test_graph_fd_loop_matches_eager_loop_exactly(self):
+    """The graph FD loop must reproduce the eager loop bit for bit."""
+    for iteration_limit, convergence_threshold in [(4, 0.1), (50, 1e-3)]:
+      eager_temp, eager_converged, _ = self._run_fd_backend(
+          iteration_limit, convergence_threshold, False, False
+      )
+      graph_temp, graph_converged, used_cuda = self._run_fd_backend(
+          iteration_limit, convergence_threshold, True, False
+      )
+      self.assertFalse(used_cuda)
       self.assertEqual(eager_temp.dtype, graph_temp.dtype)
       np.testing.assert_array_equal(eager_temp, graph_temp)
       self.assertEqual(eager_converged, graph_converged)
+
+  def test_cuda_fd_kernel_matches_eager_loop_exactly(self):
+    """The CUDA FD kernel must reproduce the eager loop bit for bit.
+
+    Covers every fused iteration count, limits that are not a multiple of it,
+    and thresholds that converge inside a fused group.
+    """
+    cases = [(4, 0.1), (13, 1e-3), (50, 1e-3), (50, 0.05)]
+    for iteration_limit, convergence_threshold in cases:
+      eager_temp, eager_converged, _ = self._run_fd_backend(
+          iteration_limit, convergence_threshold, False, False
+      )
+      for fuse_k in cuda_fd.SUPPORTED_FUSE_K:
+        cuda_temp, cuda_converged, used_cuda = self._run_fd_backend(
+            iteration_limit, convergence_threshold, True, True, fuse_k
+        )
+        if not used_cuda:
+          self.skipTest("No CUDA GPU or nvcc available.")
+        self.assertEqual(eager_temp.dtype, cuda_temp.dtype)
+        np.testing.assert_array_equal(eager_temp, cuda_temp)
+        self.assertEqual(eager_converged, cuda_converged)
 
   def test_finite_difference_convergence_with_radiative_heat_transfer(self):
     """Tests that the FD problem with radiative heat transfer converges within

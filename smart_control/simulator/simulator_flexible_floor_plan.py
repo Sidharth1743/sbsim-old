@@ -48,6 +48,7 @@ class SimulatorFlexibleGeometries(simulator.Simulator):
       start_timestamp: pd.Timestamp,
       relative_convergence_threshold: float | None = 1e-6,
       relative_convergence_streak: int = 20,
+      record_video: bool = True,
   ):
     """Simulator init.
 
@@ -67,9 +68,14 @@ class SimulatorFlexibleGeometries(simulator.Simulator):
         in max_delta is <= this for relative_convergence_streak consecutive
         iterations. Change is |max_delta(n) - max_delta(n-1)|.
       relative_convergence_streak: Consecutive iterations for early stopping.
+      record_video: Keep a copy of the temperature grid every step for the
+        video written 4 days after start_timestamp. The copies are never freed,
+        so set False when no video is wanted (for example, episodes shorter
+        than 4 days). Does not affect the simulation.
     """
     self.building = building
     self._hvac = hvac
+    self._record_video = record_video
 
     logging.info("Constructing the floorplan based simulation.")
 
@@ -181,10 +187,11 @@ class SimulatorFlexibleGeometries(simulator.Simulator):
 
     # Increment the timestamp.
     self._current_timestamp += pd.Timedelta(self._time_step_sec, unit="s")
-    self._log_and_plotter.log(self.building.temp)
+    if self._record_video:
+      self._log_and_plotter.log(self.building.temp)
 
-    if self.current_timestamp == self._start_timestamp + pd.Timedelta(days=4):
-      self.get_video(path=constants.SIM_VIDEOS_DIRPATH + video_filename)
+      if self.current_timestamp == self._start_timestamp + pd.Timedelta(days=4):
+        self.get_video(path=constants.SIM_VIDEOS_DIRPATH + video_filename)
 
   def _get_zone_reward_info(
       self,

@@ -18,6 +18,7 @@ import tensorflow as tf
 from tensorflow.python.eager import context as tf_context  # pylint: disable=g-direct-tensorflow-import
 
 from smart_control.simulator import building as building_py
+from smart_control.simulator import cuda_fd
 from smart_control.simulator import hvac_floorplan_based as hvac_py
 from smart_control.simulator import simulator_flexible_floor_plan as simulator
 from smart_control.simulator import weather_controller as weather_controller_py
@@ -504,6 +505,9 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
       relative_convergence_threshold: float | None = 1e-6,
       relative_convergence_streak: int = 20,
       use_graph_fd_loop: bool = True,
+      use_cuda_fd_kernel: bool = True,
+      cuda_fd_fuse_k: int = 8,
+      record_video: bool = True,
   ):
 
     super().__init__(
@@ -517,6 +521,7 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
         start_timestamp,
         relative_convergence_threshold=relative_convergence_threshold,
         relative_convergence_streak=relative_convergence_streak,
+        record_video=record_video,
     )
 
     # Get a mapping of all the boundary CVs that interface between interior
@@ -569,9 +574,62 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
         use_graph_fd_loop
         and not self.include_interior_mass
         and not self.include_radiative_heat_transfer
+        and self._iteration_limit >= 1
     )
+    self._cuda_fd = None
+    self._cuda_material_refs = None
+    self._cuda_fd_fuse_k = cuda_fd_fuse_k
     if self._use_graph_fd_loop:
       self._initialize_graph_fd_loop()
+      if use_cuda_fd_kernel:
+        self._cuda_fd = self._create_cuda_fd_solver()
+
+  def _create_cuda_fd_solver(self) -> Optional[cuda_fd.CudaFdSolver]:
+    """Returns the CUDA FD solver, or None when no GPU or nvcc is available.
+
+    The solver captures building.density and building.heat_capacity, so it is
+    rebuilt if either array object is replaced.
+    """
+    lib = cuda_fd.load_library()
+    if lib is None:
+      return None
+    flags = np.zeros(self.building.temp.shape, dtype=np.uint8)
+    flags |= self._t_exerior_temps_mask.numpy().astype(np.uint8)
+    for bit, mask in zip((2, 4, 8, 16), self._t_convection_masks):
+      flags |= mask.numpy().astype(np.uint8) * np.uint8(bit)
+    density = self.building.density
+    heat_capacity = self.building.heat_capacity
+    try:
+      # numpy and tf.convert_to_tensor round float64 to float32 identically.
+      solver = cuda_fd.CudaFdSolver(
+          lib,
+          batch=1,
+          shape=self.building.temp.shape,
+          iteration_limit=self._iteration_limit,
+          convergence_threshold=self._convergence_threshold,
+          floor_height_m=self.building.floor_height_cm / 100.0,
+          time_step_sec=self._time_step_sec,
+          conductivity_left=self._t_conductivity_left_edge.numpy(),
+          conductivity_right=self._t_conductivity_right_edge.numpy(),
+          conductivity_top=self._t_conductivity_top_edge.numpy(),
+          conductivity_bottom=self._t_conductivity_bottom_edge.numpy(),
+          u=self._t_u.numpy(),
+          v=self._t_v.numpy(),
+          density=density,
+          heat_capacity=heat_capacity,
+          flags=flags,
+          fuse_k=self._cuda_fd_fuse_k,
+      )
+    except (RuntimeError, ValueError) as e:
+      logging.warning('CUDA FD solver unavailable, using TF graph: %s', e)
+      return None
+    self._cuda_material_refs = (density, heat_capacity)
+    logging.info(
+        'Using the CUDA FD kernel (%d cell classes, %d fused iterations).',
+        solver.n_classes,
+        self._cuda_fd_fuse_k,
+    )
+    return solver
 
   def _initialize_graph_fd_loop(self) -> None:
     """Builds the constants and compiled loop for the graph FD timestep."""
@@ -761,10 +819,11 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
   def finite_differences_timestep(
       self, *, ambient_temperature: float, convection_coefficient: float
   ) -> bool:
-    """Runs Simulator.finite_differences_timestep as one compiled TF graph.
+    """Runs Simulator.finite_differences_timestep on the GPU or as a TF graph.
 
-    Results, warnings, and the return value match the parent method. Falls back
-    to the parent when interior mass or radiative exchange is enabled, or when
+    Results, warnings, and the return value match the parent method. Uses the
+    CUDA kernel when available, else one compiled TF graph. Falls back to the
+    parent when interior mass or radiative exchange is enabled, or when
     use_graph_fd_loop is False.
 
     Args:
@@ -781,17 +840,37 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
       )
 
     building = self.building
-    t_temp, n_iter, deltas = self._call_graph_fd_loop(  # pylint: disable=unpacking-non-sequence
-        tf.convert_to_tensor(building.temp.copy(), dtype=tf.float32),
-        tf.convert_to_tensor(building.temp, dtype=tf.float32),
-        tf.convert_to_tensor(building.input_q, dtype=tf.float32),
-        tf.convert_to_tensor(building.density, dtype=tf.float32),
-        tf.convert_to_tensor(building.heat_capacity, dtype=tf.float32),
-        tf.constant(ambient_temperature, dtype=tf.float32),
-        tf.constant(convection_coefficient, dtype=tf.float32),
-    )
-    n_iter = int(n_iter)
-    deltas = deltas.numpy()
+    if self._cuda_fd is not None and (
+        self._cuda_material_refs[0] is not building.density
+        or self._cuda_material_refs[1] is not building.heat_capacity
+    ):
+      self._cuda_fd = self._create_cuda_fd_solver()
+    if self._cuda_fd is not None:
+      # numpy and tf.convert_to_tensor round float64 to float32 identically.
+      out, n_iter_arr, deltas_arr = self._cuda_fd.step(
+          np.asarray(building.temp, dtype=np.float32)[None],
+          np.asarray(building.input_q, dtype=np.float32)[None],
+          np.array([ambient_temperature], dtype=np.float32),
+          np.array([convection_coefficient], dtype=np.float32),
+      )
+      n_iter = int(n_iter_arr[0])
+      deltas = deltas_arr[0].copy()
+      # A new array each step, as t_temp.numpy() gives in the graph path.
+      new_temp = out[0].copy()
+    else:
+      t_temp, n_iter, deltas = self._call_graph_fd_loop(  # pylint: disable=unpacking-non-sequence
+          tf.convert_to_tensor(building.temp.copy(), dtype=tf.float32),
+          tf.convert_to_tensor(building.temp, dtype=tf.float32),
+          tf.convert_to_tensor(building.input_q, dtype=tf.float32),
+          tf.convert_to_tensor(building.density, dtype=tf.float32),
+          tf.convert_to_tensor(building.heat_capacity, dtype=tf.float32),
+          tf.constant(ambient_temperature, dtype=tf.float32),
+          tf.constant(convection_coefficient, dtype=tf.float32),
+      )
+      n_iter = int(n_iter)
+      deltas = deltas.numpy()
+      new_temp = t_temp.numpy()
+
     if n_iter >= self._iteration_warning:
       logging.warning(
           'Step %d, not converged in %d steps, max_delta = %3.3f',
@@ -808,7 +887,7 @@ class TFSimulator(simulator.SimulatorFlexibleGeometries):
           deltas[n_iter - 1] if n_iter > 0 else float('nan'),
       )
 
-    building.temp = t_temp.numpy()
+    building.temp = new_temp
     return converged_successfully
 
   def _get_tensor_exterior_mask(

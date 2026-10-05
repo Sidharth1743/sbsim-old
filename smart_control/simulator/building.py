@@ -1336,6 +1336,36 @@ class FloorPlanBasedBuilding(BaseSimulatorBuilding):
 
     zone_coordinates = self._room_dict[zone_name]
 
+    # For a float64 or Python float power, each loop product is a float64
+    # multiply, which the vectorized form below performs identically. Other
+    # power types keep the loop so numpy's scalar promotion still applies.
+    if type(power) in (float, np.float64):  # pylint: disable=unidiomatic-typecheck
+      cache = self.__dict__.setdefault("_zone_diffuser_cache", {})
+      cached = cache.get(zone_name)
+      if (
+          cached is None
+          or cached[0] is not zone_coordinates
+          or cached[1] is not self.diffusers
+          or cached[2] != len(zone_coordinates)
+      ):
+        coords = np.asarray(zone_coordinates, dtype=np.int64).reshape(-1, 2)
+        rows, cols = coords[:, 0], coords[:, 1]
+        selected = self.diffusers[rows, cols] > 0.0
+        rows, cols = rows[selected], cols[selected]
+        values = self.diffusers[rows, cols].astype(np.float64)
+        cached = (
+            zone_coordinates,
+            self.diffusers,
+            len(zone_coordinates),
+            rows,
+            cols,
+            values,
+        )
+        cache[zone_name] = cached
+      rows, cols, values = cached[3], cached[4], cached[5]
+      self.input_q[rows, cols] = np.float64(power) * values
+      return
+
     for coord in zone_coordinates:
       if self.diffusers[coord] > 0.0:
         self.input_q[coord] = power * self.diffusers[coord]

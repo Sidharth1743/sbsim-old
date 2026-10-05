@@ -216,15 +216,25 @@ class ReplayWeatherController(BaseWeatherController):
 
     return df
 
+  def _time_bounds(self) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Returns (min, max) of the Time column, cached per weather_df."""
+    df = self.weather_df
+    cached = self.__dict__.get('_time_bounds_cache')
+    if cached is None or cached[0] is not df or cached[1] != len(df):
+      times = df['Time']
+      cached = (df, len(df), min(times), max(times))
+      self.__dict__['_time_bounds_cache'] = cached
+    return cached[2], cached[3]
+
   @property
   def min_time(self) -> pd.Timestamp:
     """Earliest timestamp in the weather data."""
-    return min(self.weather_df['Time'])
+    return self._time_bounds()[0]
 
   @property
   def max_time(self) -> pd.Timestamp:
     """Latest timestamp in the weather data."""
-    return max(self.weather_df['Time'])
+    return self._time_bounds()[1]
 
   @property
   def times_in_seconds(self) -> pd.Index:
