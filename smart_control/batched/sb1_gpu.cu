@@ -110,7 +110,9 @@ struct Sb1Gpu {
   int n_classes_fast;
   int *class_rooms[4];
   int class_count[4];
-  int class_shared[4];
+  int class_shared_list[4], class_shared_apply[4];
+  unsigned short *fast_list;  // batch * max_swaps: shuffled swap list per room
+  int *fast_n;                // batch * n_rooms: list length per room
   // Pinned host staging for per-step inputs and outputs, so that enqueueing
   // never waits on pageable copies. When defer_sync is set, the step entry
   // points return without synchronizing; call sb1_sync before reading means.
@@ -287,26 +289,38 @@ static __device__ uint64_t fast_randbelow(FastStream &s, uint64_t n) {
 }
 
 #define FAST_RING 1024
+#define FAST_THREADS 256
 
-// One warp per (env, room). Shared memory: list[m], perm[m], ring[FAST_RING]
-// (uint16; rooms have fewer than 65536 CVs).
+// Fast-mode swaps run as two kernels with one block of FAST_THREADS per
+// (env, room), so each needs only one room-sized shared array (uint16; rooms
+// have fewer than 65536 CVs):
 //
-// The swaps of the reference are applied to a permutation of the room's cells
-// instead of to the temperatures: swapping the values of cells a and b is
-// swapping perm[a] and perm[b], where the value at cell x is old[perm[x]].
-// The final gather writes old[perm[x]] to every cell, which is the same grid.
-__global__ void fast_swaps(Sb1Gpu g, const int *rooms, int n_class_rooms) {
+// * fast_swap_list: inclusion and candidate per CV, then Fisher-Yates on the
+//   list of included CVs; writes the list to fast_list and its length to
+//   fast_n. Shared memory: list[m], ring[FAST_RING].
+// * fast_swap_apply: applies the swaps in list order to a permutation of the
+//   room's cells instead of to the temperatures: swapping the values of cells
+//   a and b is swapping perm[a] and perm[b], where the value at cell x is
+//   old[perm[x]]. The final gather writes old[perm[x]] to every cell, which is
+//   the same grid. Shared memory: perm[m], ring_a and ring_c[FAST_RING].
+//
+// Random draws, gathers and ring fills use the whole block; the two swap
+// chains, which are sequential in the reference, run on thread 0.
+__global__ void __launch_bounds__(FAST_THREADS)
+    fast_swap_list(Sb1Gpu g, const int *rooms, int n_class_rooms) {
   int ri = blockIdx.x;
   int b = blockIdx.y;
   if (ri >= n_class_rooms || !g.active[b]) return;
   int r = rooms[ri];
   extern __shared__ unsigned short shm[];
-  const int lane = threadIdx.x;
+  __shared__ int warp_count[FAST_THREADS / 32];
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
   const int64_t base = g.room_off[r];
   const int m = (int)(g.room_off[r + 1] - base);
   unsigned short *list = shm;
-  unsigned short *perm = shm + m;
-  unsigned short *ring = shm + 2 * m;
+  unsigned short *ring = shm + m;
   float *x = g.temp + (int64_t)b * g.cells;
   int *b_local = g.swap_b + (int64_t)b * g.max_swaps + base;
   float *old = (float *)(g.swap_a + (int64_t)b * g.max_swaps + base);
@@ -315,11 +329,13 @@ __global__ void fast_swaps(Sb1Gpu g, const int *rooms, int n_class_rooms) {
   const uint32_t s_lo = (uint32_t)(step & 0xffffffffull);
   const uint32_t s_hi = (uint32_t)(step >> 32);
 
-  // Phase A: inclusion and candidate per CV, in CV order (ballot keeps the
-  // order of the reference's sequential loop).
+  // Phase A: inclusion and candidate per CV. Included CVs are appended to
+  // list in CV order, as the reference's sequential loop does: warp w covers
+  // the w-th 32 CVs of each chunk, ballot orders lanes, warp_count orders
+  // warps.
   int n = 0;
-  for (int start = 0; start < m; start += 32) {
-    int i = start + lane;
+  for (int start = 0; start < m; start += FAST_THREADS) {
+    int i = start + tid;
     bool include = false;
     if (i < m) {
       int64_t c = base + i;
@@ -339,20 +355,23 @@ __global__ void fast_swaps(Sb1Gpu g, const int *rooms, int n_class_rooms) {
         b_local[i] = g.cand_local[g.cand_off[c] + j];
       }
       old[i] = x[g.cvs[c]];
-      perm[i] = (unsigned short)i;
     }
     unsigned int mask = __ballot_sync(0xffffffffu, include);
-    if (include) list[n + __popc(mask & ((1u << lane) - 1u))] = (unsigned short)i;
-    n += __popc(mask);
+    if (lane == 0) warp_count[warp] = __popc(mask);
+    __syncthreads();
+    int offset = n;
+    for (int w = 0; w < warp; w++) offset += warp_count[w];
+    if (include) list[offset + __popc(mask & ((1u << lane) - 1u))] = (unsigned short)i;
+    for (int w = 0; w < FAST_THREADS / 32; w++) n += warp_count[w];
+    __syncthreads();
   }
-  __syncwarp();
 
-  // Fisher-Yates on list: j_i depends only on i, so lanes draw a chunk of
-  // j's, then lane 0 performs that chunk's swaps in descending i.
+  // Fisher-Yates on list: j_i depends only on i, so the block draws a chunk
+  // of j's, then thread 0 performs that chunk's swaps in descending i.
   for (int hi = n - 1; hi >= 1; hi -= FAST_RING) {
     int lo = hi - FAST_RING + 1;
     if (lo < 1) lo = 1;
-    for (int i = hi - lane; i >= lo; i -= 32) {
+    for (int i = hi - tid; i >= lo; i -= FAST_THREADS) {
       FastStream s;
       s.key[0] = k0 ^ 0x6A09E667u;
       s.key[1] = k1 ^ 0xBB67AE85u ^ s_hi;
@@ -364,36 +383,89 @@ __global__ void fast_swaps(Sb1Gpu g, const int *rooms, int n_class_rooms) {
       s.used = 4;
       ring[hi - i] = (unsigned short)fast_randbelow(s, (uint64_t)(i + 1));
     }
-    __syncwarp();
-    if (lane == 0) {
+    __syncthreads();
+    if (tid == 0) {
+      // Same swaps as list[i] <-> list[ring[hi - i]] for i = hi..lo. The
+      // next j and list[i - 1] are loaded before this iteration's stores (all
+      // of shm may alias, so the compiler would otherwise wait for them);
+      // list[i - 1] changes in this iteration only when j == i - 1.
+      int j = ring[0];
+      unsigned short li = list[hi];
       for (int i = hi; i >= lo; i--) {
-        int j = ring[hi - i];
-        unsigned short t = list[i];
-        list[i] = list[j];
-        list[j] = t;
+        int nj = 0;
+        unsigned short nli = 0;
+        if (i > lo) {
+          nj = ring[hi - i + 1];
+          nli = list[i - 1];
+        }
+        unsigned short lj = list[j];
+        list[i] = lj;
+        list[j] = li;
+        if (j == i - 1) nli = li;
+        j = nj;
+        li = nli;
       }
     }
-    __syncwarp();
+    __syncthreads();
   }
 
-  // Apply the swaps in list order to perm; lanes prefetch the partners.
+  unsigned short *out = g.fast_list + (int64_t)b * g.max_swaps + base;
+  for (int k = tid; k < n; k += FAST_THREADS) out[k] = list[k];
+  if (tid == 0) g.fast_n[(int64_t)b * g.n_rooms + r] = n;
+}
+
+__global__ void __launch_bounds__(FAST_THREADS)
+    fast_swap_apply(Sb1Gpu g, const int *rooms, int n_class_rooms) {
+  int ri = blockIdx.x;
+  int b = blockIdx.y;
+  if (ri >= n_class_rooms || !g.active[b]) return;
+  int r = rooms[ri];
+  extern __shared__ unsigned short shm[];
+  const int tid = threadIdx.x;
+  const int64_t base = g.room_off[r];
+  const int m = (int)(g.room_off[r + 1] - base);
+  const int n = g.fast_n[(int64_t)b * g.n_rooms + r];
+  unsigned short *perm = shm;
+  unsigned short *ring_a = shm + m;
+  unsigned short *ring_c = shm + m + FAST_RING;
+  float *x = g.temp + (int64_t)b * g.cells;
+  const int *b_local = g.swap_b + (int64_t)b * g.max_swaps + base;
+  const float *old = (const float *)(g.swap_a + (int64_t)b * g.max_swaps + base);
+  const unsigned short *list = g.fast_list + (int64_t)b * g.max_swaps + base;
+  for (int i = tid; i < m; i += FAST_THREADS) perm[i] = (unsigned short)i;
+  __syncthreads();
+
+  // Apply the swaps in list order to perm; the block prefetches each chunk's
+  // pairs (list[k], partner of list[k]) into the rings.
   for (int start = 0; start < n; start += FAST_RING) {
     int end = start + FAST_RING < n ? start + FAST_RING : n;
-    for (int k = start + lane; k < end; k += 32)
-      ring[k - start] = (unsigned short)b_local[list[k]];
-    __syncwarp();
-    if (lane == 0) {
-      for (int k = start; k < end; k++) {
-        int a = list[k], c = ring[k - start];
-        unsigned short t = perm[a];
-        perm[a] = perm[c];
-        perm[c] = t;
+    for (int k = start + tid; k < end; k += FAST_THREADS) {
+      unsigned short a = list[k];
+      ring_a[k - start] = a;
+      ring_c[k - start] = (unsigned short)b_local[a];
+    }
+    __syncthreads();
+    if (tid == 0) {
+      // The rings are read-only here, so the next pair is loaded before this
+      // iteration's stores to perm.
+      int a = ring_a[0], c = ring_c[0];
+      for (int k = 0; k < end - start; k++) {
+        int na = 0, nc = 0;
+        if (k + 1 < end - start) {
+          na = ring_a[k + 1];
+          nc = ring_c[k + 1];
+        }
+        unsigned short pa = perm[a], pc = perm[c];
+        perm[a] = pc;
+        perm[c] = pa;
+        a = na;
+        c = nc;
       }
     }
-    __syncwarp();
+    __syncthreads();
   }
 
-  for (int i = lane; i < m; i += 32) x[g.cvs[base + i]] = old[perm[i]];
+  for (int i = tid; i < m; i += FAST_THREADS) x[g.cvs[base + i]] = old[perm[i]];
 }
 
 __global__ void mean_chunks(Sb1Gpu g) {
@@ -460,7 +532,7 @@ void sb1_destroy(void *handle) {
                   g->cand_off,  g->cvs,       g->cands,      g->feed,
                   g->feed_off,  g->keys,      g->rng_step,   g->cand_local,
                   g->class_rooms[0], g->class_rooms[1], g->class_rooms[2],
-                  g->class_rooms[3]};
+                  g->class_rooms[3], g->fast_list, g->fast_n};
   for (size_t k = 0; k < sizeof(ptrs) / sizeof(ptrs[0]); k++) cudaFree(ptrs[k]);
   void *pinned[] = {g->h_temp_inf, g->h_conv, g->h_means, g->h_active,
                     g->h_keys, g->h_steps, g->h_q};
@@ -716,13 +788,21 @@ int sb1_set_fast_plan(void *handle, const int *cand_local, int64_t n_cands,
     fail |= up((void **)&g->class_rooms[k], class_rooms_flat + offset,
                class_count[k] * sizeof(int));
     g->class_count[k] = class_count[k];
-    g->class_shared[k] =
-        (int)((2 * (int64_t)class_max_cvs[k] + FAST_RING) * sizeof(unsigned short));
-    if (g->class_shared[k] > max_shared) max_shared = g->class_shared[k];
+    g->class_shared_list[k] =
+        (int)(((int64_t)class_max_cvs[k] + FAST_RING) * sizeof(unsigned short));
+    g->class_shared_apply[k] =
+        (int)(((int64_t)class_max_cvs[k] + 2 * FAST_RING) * sizeof(unsigned short));
+    if (g->class_shared_apply[k] > max_shared) max_shared = g->class_shared_apply[k];
     offset += class_count[k];
   }
   g->n_classes_fast = n_classes;
-  if (cudaFuncSetAttribute(fast_swaps, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  fail |= cudaMalloc((void **)&g->fast_list,
+                     (size_t)g->batch * g->max_swaps * sizeof(unsigned short)) != cudaSuccess;
+  fail |= cudaMalloc((void **)&g->fast_n,
+                     (size_t)g->batch * g->n_rooms * sizeof(int)) != cudaSuccess;
+  if (cudaFuncSetAttribute(fast_swap_list, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           max_shared) != cudaSuccess ||
+      cudaFuncSetAttribute(fast_swap_apply, cudaFuncAttributeMaxDynamicSharedMemorySize,
                            max_shared) != cudaSuccess)
     return (int)cudaErrorInvalidValue;
   return fail ? (int)cudaErrorMemoryAllocation : 0;
@@ -744,8 +824,10 @@ int sb1_swaps_fast(void *handle, const uint32_t *keys,
   for (int k = 0; k < g->n_classes_fast; k++) {
     if (g->class_count[k] == 0) continue;
     dim3 grid(g->class_count[k], g->batch);
-    fast_swaps<<<grid, 32, g->class_shared[k], s>>>(*g, g->class_rooms[k],
-                                                    g->class_count[k]);
+    fast_swap_list<<<grid, FAST_THREADS, g->class_shared_list[k], s>>>(
+        *g, g->class_rooms[k], g->class_count[k]);
+    fast_swap_apply<<<grid, FAST_THREADS, g->class_shared_apply[k], s>>>(
+        *g, g->class_rooms[k], g->class_count[k]);
   }
   return g->defer_sync ? (int)cudaGetLastError() : (int)cudaStreamSynchronize(s);
 }

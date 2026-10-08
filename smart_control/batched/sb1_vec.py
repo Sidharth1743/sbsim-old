@@ -24,6 +24,7 @@ import ctypes
 import hashlib
 import math
 import os
+import random
 import subprocess
 import tempfile
 
@@ -98,7 +99,8 @@ class SB1VecBatch(sb1_gpu_engine.SB1GpuBatch):
 
   def __init__(self, ref_env: env_lib.Environment, batch: int,
                rng: str = "exact", seed: int = 0,
-               swap_threads: int | None = None, gpu_parts: int = 1):
+               swap_threads: int | None = None, gpu_parts: int = 1,
+               reward: str = "sbsim"):
     """Creates the batch.
 
     Args:
@@ -116,9 +118,17 @@ class SB1VecBatch(sb1_gpu_engine.SB1GpuBatch):
       gpu_parts: GPU contexts (streams) the batch is split over, so swap
         generation of one part overlaps the FD of another. Results do not
         depend on it.
+      reward: "sbsim": the gin reward function (SetpointEnergyCarbonRegret,
+        bit-exact with the original). "competition": the Smart Buildings
+        competition reward, r = 0.6 comfort - 0.2 energy - 0.2 carbon (see
+        _reward_vec). Only the returned reward differs; the simulation is the
+        same.
     """
     if rng not in ("exact", "feed", "fast"):
       raise ValueError(f"Unknown rng mode {rng}.")
+    if reward not in ("sbsim", "competition"):
+      raise ValueError(f"Unknown reward {reward}.")
+    self.reward = reward
     self._gpu_parts = gpu_parts
     super().__init__(ref_env, batch)
     B, Z = self.batch, len(self.zones)
@@ -127,20 +137,15 @@ class SB1VecBatch(sb1_gpu_engine.SB1GpuBatch):
     self._occ_mt = np.zeros((B, 624), dtype=np.uint32)
     self._occ_idx = np.zeros(B, dtype=np.int64)
     for b in range(B):
-      rs = self._occ_rng[b]
-      if rng == "fast":
-        rs = np.random.RandomState(_splitmix64(seed * 1_000_003 + b) & 0xFFFFFFFF)
-      st = rs.get_state()
+      st = self._occ_rng[b].get_state()
       self._occ_mt[b] = st[1]
       self._occ_idx[b] = st[2]
     self._gpu.set_plan(self._conv_plan, self._conv_p)
     if rng == "fast":
       self._gpu.set_fast_plan(self._conv_plan)
     self._philox_keys = np.zeros((B, 2), dtype=np.uint32)
-    for b in range(B):
-      key = _splitmix64(seed * 2_000_003 + b)
-      self._philox_keys[b] = (key & 0xFFFFFFFF, key >> 32)
     self._philox_step = np.zeros(B, dtype=np.uint64)
+    self._seed_streams(seed, occupancy=rng == "fast")
     self._feed_words = None
     self._occ_u8 = self._occ_state.astype(np.uint8)
     self._boiler_action_arr = np.full(B, -(10**9), dtype=np.int64)
@@ -151,7 +156,56 @@ class SB1VecBatch(sb1_gpu_engine.SB1GpuBatch):
     self._build_observation_plan()
     self._build_reward_plan()
 
+  def _seed_streams(self, seed: int, occupancy: bool) -> None:
+    """Sets the fast-mode Philox keys (and occupancy streams) from seed."""
+    for b in range(self.batch):
+      if occupancy:
+        rs = np.random.RandomState(_splitmix64(seed * 1_000_003 + b) & 0xFFFFFFFF)
+        st = rs.get_state()
+        self._occ_mt[b] = st[1]
+        self._occ_idx[b] = st[2]
+      key = _splitmix64(seed * 2_000_003 + b)
+      self._philox_keys[b] = (key & 0xFFFFFFFF, key >> 32)
+    self._philox_step[:] = 0
+
+  def reseed(self, seed: int) -> None:
+    """Fast mode: gives every env new occupancy and convection streams.
+
+    Env b gets the streams that rng="fast", seed=seed gives it at
+    construction. Call before reset(); state that survives reset() (occupant
+    presence, thermostat modes) is kept.
+    """
+    if self.rng != "fast":
+      raise ValueError("reseed needs rng='fast'.")
+    self._seed_streams(seed, occupancy=True)
+
   # ------------------------------------------------------------- tables
+  def set_original_seeds(self, convection_seeds, occupancy_seeds) -> None:
+    """Gives each env the streams the original code would have with seeds.
+
+    Env b then matches an original run after random.seed(convection_seeds[b])
+    and an occupancy RandomState(occupancy_seeds[b]). The original gin seeds
+    are 5 (convection) and 17321 (occupancy). Only for rng "exact" or "feed",
+    and only before reset(), since reset() already draws occupancy.
+
+    Args:
+      convection_seeds: one Python random seed per env.
+      occupancy_seeds: one numpy RandomState seed per env.
+    """
+    if self.rng == "fast":
+      raise ValueError("Original seeds apply to rng 'exact' or 'feed'.")
+    if getattr(self, "_started", False):
+      raise RuntimeError("Call set_original_seeds before reset() or step().")
+    if len(convection_seeds) != self.batch or len(occupancy_seeds) != self.batch:
+      raise ValueError("Need one convection and one occupancy seed per env.")
+    for b, (cs, os_) in enumerate(zip(convection_seeds, occupancy_seeds)):
+      state = random.Random(cs).getstate()
+      self._conv_mt[b] = np.array(state[1][:-1], dtype=np.uint32)
+      self._conv_index[b] = state[1][-1]
+      occ_state = np.random.RandomState(os_).get_state()
+      self._occ_mt[b] = occ_state[1]
+      self._occ_idx[b] = occ_state[2]
+
   def _build_tables(self) -> None:
     """Arrays over k in [-1, kmax] (index k + 1), from the original code."""
     kmax = self._num_timesteps + 3
@@ -494,6 +548,44 @@ class SB1VecBatch(sb1_gpu_engine.SB1GpuBatch):
     carbon = (actual_e_carbon + actual_g_carbon) / (max_e_carbon + max_g_carbon)
     raw = regret * rw["w_p"] - energy * rw["w_e"] - carbon * rw["w_c"]
     value = raw / (rw["w_p"] + rw["w_e"] + rw["w_c"])
+    # Competition comfort penalty (competition.html): 0 inside the zone's
+    # heating/cooling band, d kelvin outside it up to 5 K, then quadratic with
+    # no lower limit. The quadratic is not specified there; (d^2 + 25) / 10
+    # joins d at 5 K with the same value and slope. Averaged over occupied
+    # zones; 0 when no zone is occupied.
+    zt64 = zone_t.astype(np.float64)
+    d = (np.maximum(heat[:, None] - zt64, 0.0)
+         + np.maximum(zt64 - cool[:, None], 0.0))
+    penalty = np.where(d <= 5.0, d, (d * d + 25.0) / 10.0)
+    occupied = occ32 > 0.0
+    n_occupied = occupied.sum(axis=1)
+    comfort_penalty = np.where(
+        n_occupied > 0,
+        np.where(occupied, penalty, 0.0).sum(axis=1) / np.maximum(n_occupied, 1),
+        0.0,
+    )
+    if self.reward == "competition":
+      value = -0.6 * comfort_penalty - 0.2 * energy - 0.2 * carbon
+    # Monitoring copies of the reward terms (RewardResponse fields); they do
+    # not feed back into the simulation or the reward.
+    terms = {
+        "normalized_productivity_regret": regret,
+        "normalized_energy_cost": energy,
+        "normalized_carbon_emission": carbon,
+        "electricity_energy_cost_usd": actual_e_cost,
+        "natural_gas_energy_cost_usd": actual_g_cost,
+        "carbon_emitted_kg": actual_e_carbon + actual_g_carbon,
+        "total_occupancy": total_occ,
+        "electrical_power_w": electricity,
+        "natural_gas_power_w": gas_sum,
+        "comfort_penalty_k": comfort_penalty,
+    }
+    if not hasattr(self, "last_reward_terms"):
+      self.last_reward_terms = {
+          name: np.zeros(self.batch) for name in terms
+      }
+    for name, values in terms.items():
+      self.last_reward_terms[name][ix] = values
     return value.astype(np.float32)
 
 
@@ -632,6 +724,7 @@ class SB1VecBatch(sb1_gpu_engine.SB1GpuBatch):
     return q
 
   def _reset_vec(self, mask: np.ndarray) -> np.ndarray:
+    self._started = True
     self._reset_device_state(mask)
     ix = np.flatnonzero(mask)
     self._episode_ended[ix] = False

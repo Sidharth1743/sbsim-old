@@ -51,11 +51,15 @@ struct ClassStatic {
   int flags;
 };
 
-// Per class constants for one environment and timestep.
-struct ClassStep {
-  float k1u, k3u, k2v, k4v, uz, vz, storage, denom;
-  float h_left_tinf, h_right_tinf, h_above_tinf, h_below_tinf;
+// Per class constants for one environment and timestep. The fields the
+// iteration reads fill the first three 16-byte words, so the kernel loads them
+// from shared memory with three vector loads (see iterate_fused).
+struct __align__(16) ClassStep {
   int exterior;
+  float k1u, k3u, k2v;
+  float k4v, uz, vz, denom;
+  float h_left_tinf, h_right_tinf, h_above_tinf, h_below_tinf;
+  float storage, pad0, pad1, pad2;
 };
 
 struct FdContext {
@@ -147,6 +151,7 @@ __global__ void prepare_class_step(FdContext c) {
   o.h_above_tinf = __fmul_rn(tinf, h_top);
   o.h_below_tinf = __fmul_rn(tinf, h_bottom);
   o.exterior = (s.flags & FLAG_EXTERIOR) != 0;
+  o.pad0 = o.pad1 = o.pad2 = 0.0f;
   c.class_step[idx] = o;
 }
 
@@ -159,7 +164,8 @@ __global__ void __launch_bounds__(THREADS)
   constexpr int TILE_H = REGION_H - 2 * K;
   __shared__ float sa[REGION_H][REGION_W];
   __shared__ float sb[REGION_H][REGION_W];
-  __shared__ ClassStep classes[MAX_CLASSES];
+  // Words 0-2 of each ClassStep (everything the iteration reads).
+  __shared__ float4 class_w[MAX_CLASSES][3];
   __shared__ unsigned int warp_max[THREADS / 32];
 
   const int b = blockIdx.z;
@@ -167,8 +173,13 @@ __global__ void __launch_bounds__(THREADS)
   if (niter <= 0) return;  // Uniform across the block.
 
   const int tid = threadIdx.y * REGION_W + threadIdx.x;
-  for (int k = tid; k < c.n_classes; k += THREADS)
-    classes[k] = c.class_step[b * c.n_classes + k];
+  for (int k = tid; k < c.n_classes; k += THREADS) {
+    const float4 *g =
+        reinterpret_cast<const float4 *>(&c.class_step[b * c.n_classes + k]);
+    class_w[k][0] = g[0];
+    class_w[k][1] = g[1];
+    class_w[k][2] = g[2];
+  }
 
   if (c.tile_ext[blockIdx.y * gridDim.x + blockIdx.x]) {
     // Every in-grid owner CV is exterior, so every iteration sets it to tinf.
@@ -231,7 +242,9 @@ __global__ void __launch_bounds__(THREADS)
       cls[m] = c.cls[i];
       val = cur[base + i];
       nt3[m] = __fdiv_rn(
-          __fmul_rn(classes[cls[m]].storage, c.temp_minus[base + i]), delta_t);
+          __fmul_rn(c.class_step[b * c.n_classes + cls[m]].storage,
+                    c.temp_minus[base + i]),
+          delta_t);
       q[m] = c.input_q[base + i];
     }
     sa[lr][lc] = val;
@@ -249,32 +262,37 @@ __global__ void __launch_bounds__(THREADS)
       bool compute = in_grid[m] && lr >= j + 1 && lr <= REGION_H - 2 - j &&
                      lc >= j + 1 && lc <= REGION_W - 2 - j;
       if (compute) {
-        const ClassStep &s = classes[cls[m]];
+        // w0 = {exterior, k1u, k3u, k2v}, w1 = {k4v, uz, vz, denom},
+        // w2 = {h_left_tinf, h_right_tinf, h_above_tinf, h_below_tinf}.
+        const float4 *sv = class_w[cls[m]];
+        const float4 w0 = sv[0];
         float t = src[lr][lc];
         // Exterior CVs are set to tinf after the update, so their arithmetic
         // does not change the result and is skipped.
         float est = tinf;
-        if (!s.exterior) {
+        if (!__float_as_int(w0.x)) {
+          const float4 w1 = sv[1];
+          const float4 w2 = sv[2];
           float t_left = src[lr][lc + 1];
           float t_right = src[lr][lc - 1];
           float t_above = src[lr - 1][lc];
           float t_below = src[lr + 1][lc];
           float nt1 =
-              __fadd_rn(__fmul_rn(s.k1u, t_left), __fmul_rn(s.k3u, t_right));
-          nt1 = __fadd_rn(nt1, s.h_left_tinf);
-          nt1 = __fadd_rn(nt1, s.h_right_tinf);
-          nt1 = __fmul_rn(s.vz, nt1);
+              __fadd_rn(__fmul_rn(w0.y, t_left), __fmul_rn(w0.z, t_right));
+          nt1 = __fadd_rn(nt1, w2.x);
+          nt1 = __fadd_rn(nt1, w2.y);
+          nt1 = __fmul_rn(w1.z, nt1);
           float nt2 =
-              __fadd_rn(__fmul_rn(s.k2v, t_below), __fmul_rn(s.k4v, t_above));
-          nt2 = __fadd_rn(nt2, s.h_below_tinf);
-          nt2 = __fadd_rn(nt2, s.h_above_tinf);
-          nt2 = __fmul_rn(s.uz, nt2);
+              __fadd_rn(__fmul_rn(w0.w, t_below), __fmul_rn(w1.x, t_above));
+          nt2 = __fadd_rn(nt2, w2.w);
+          nt2 = __fadd_rn(nt2, w2.z);
+          nt2 = __fmul_rn(w1.y, nt2);
           float numer = __fadd_rn(nt1, nt2);
           numer = __fadd_rn(numer, nt3[m]);
           numer = __fadd_rn(numer, q[m]);
           numer = __fadd_rn(numer, 0.0f);
           numer = __fadd_rn(numer, 0.0f);
-          est = __fdiv_rn(numer, s.denom);
+          est = __fdiv_rn(numer, w1.w);
         }
         dst[lr][lc] = est;
         bool owner = lr >= K && lr < REGION_H - K && lc >= K &&
